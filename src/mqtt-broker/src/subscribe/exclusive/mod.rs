@@ -15,10 +15,16 @@
 use super::common::loop_commit_offset;
 use super::common::Subscriber;
 use super::manager::SubscribeManager;
-use super::push::{build_publish_message, send_publish_packet_to_client};
+use super::push::{
+    build_publish_message, send_publish_packet_to_client, BuildPublishMessageContext,
+};
+use crate::common::metrics_cache::MetricsCacheManager;
 use crate::common::types::ResultMqttBrokerError;
 use crate::handler::cache::CacheManager;
 use crate::handler::error::MqttBrokerError;
+use crate::observability::slow::core::{
+    get_calculate_time_from_broker_config, record_slow_subscribe_data,
+};
 use crate::server::common::connection_manager::ConnectionManager;
 use crate::storage::message::MessageStorage;
 use crate::subscribe::common::is_ignore_push_error;
@@ -41,6 +47,7 @@ pub struct ExclusivePush {
     subscribe_manager: Arc<SubscribeManager>,
     connection_manager: Arc<ConnectionManager>,
     message_storage: ArcStorageAdapter,
+    metrics_cache_manager: Arc<MetricsCacheManager>,
 }
 
 impl ExclusivePush {
@@ -49,12 +56,14 @@ impl ExclusivePush {
         cache_manager: Arc<CacheManager>,
         subscribe_manager: Arc<SubscribeManager>,
         connection_manager: Arc<ConnectionManager>,
+        metrics_cache_manager: Arc<MetricsCacheManager>,
     ) -> Self {
         ExclusivePush {
             message_storage,
             cache_manager,
             subscribe_manager,
             connection_manager,
+            metrics_cache_manager,
         }
     }
 
@@ -106,6 +115,7 @@ impl ExclusivePush {
             let cache_manager = self.cache_manager.clone();
             let connection_manager = self.connection_manager.clone();
             let subscribe_manager = self.subscribe_manager.clone();
+            let metrics_cache_manager = self.metrics_cache_manager.clone();
 
             // Subscribe to the data push thread
             self.subscribe_manager.exclusive_push_thread.insert(
@@ -157,17 +167,20 @@ impl ExclusivePush {
                             }
                         },
                         val = pub_message(
-                                &subscribe_manager,
-                                &connection_manager,
-                                &message_storage,
-                                &cache_manager,
-                                &subscriber,
-                                &group_id,
-                                &qos,
-                                &sub_ids,
+                            ExclusivePushContext {
+                                subscribe_manager: subscribe_manager.clone(),
+                                connection_manager: connection_manager.clone(),
+                                message_storage: message_storage.clone(),
+                                cache_manager: cache_manager.clone(),
+                                metrics_cache_manager: metrics_cache_manager.clone(),
+                                subscriber: subscriber.clone(),
+                                group_id: group_id.clone(),
+                                qos,
+                                sub_ids: sub_ids.clone(),
                                 offset,
-                                &exclusive_key,
-                                &sub_thread_stop_sx
+                                exclusive_key: exclusive_key.clone(),
+                                sub_thread_stop_sx: sub_thread_stop_sx.clone(),
+                            }
                             ) => {
                                 match val{
                                     Ok(offset_op) => {
@@ -195,23 +208,27 @@ impl ExclusivePush {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn pub_message(
-    subscribe_manager: &Arc<SubscribeManager>,
-    connection_manager: &Arc<ConnectionManager>,
-    message_storage: &MessageStorage,
-    cache_manager: &Arc<CacheManager>,
-    subscriber: &Subscriber,
-    group_id: &str,
-    qos: &QoS,
-    sub_ids: &[usize],
-    offset: u64,
-    exclusive_key: &str,
-    sub_thread_stop_sx: &broadcast::Sender<bool>,
-) -> Result<Option<u64>, MqttBrokerError> {
+#[derive(Clone)]
+pub struct ExclusivePushContext {
+    pub subscribe_manager: Arc<SubscribeManager>,
+    pub connection_manager: Arc<ConnectionManager>,
+    pub message_storage: MessageStorage,
+    pub cache_manager: Arc<CacheManager>,
+    pub metrics_cache_manager: Arc<MetricsCacheManager>,
+    pub subscriber: Subscriber,
+    pub group_id: String,
+    pub qos: QoS,
+    pub sub_ids: Vec<usize>,
+    pub offset: u64,
+    pub exclusive_key: String,
+    pub sub_thread_stop_sx: broadcast::Sender<bool>,
+}
+
+async fn pub_message(context: ExclusivePushContext) -> Result<Option<u64>, MqttBrokerError> {
     let record_num = 5;
-    let results = message_storage
-        .read_topic_message(&subscriber.topic_id, offset, record_num)
+    let results = context
+        .message_storage
+        .read_topic_message(&context.subscriber.topic_id, context.offset, record_num)
         .await?;
 
     let push_fn = async |record: &Record| -> ResultMqttBrokerError {
@@ -222,38 +239,56 @@ async fn pub_message(
         };
 
         // build publish params
-        let sub_pub_param = if let Some(params) = build_publish_message(
-            cache_manager,
-            connection_manager,
-            &subscriber.client_id,
-            record.to_owned(),
-            group_id,
-            qos,
-            subscriber,
-            sub_ids,
-        )
-        .await?
+        let sub_pub_param = if let Some(params) =
+            build_publish_message(BuildPublishMessageContext {
+                cache_manager: context.cache_manager.clone(),
+                connection_manager: context.connection_manager.clone(),
+                client_id: context.subscriber.client_id.clone(),
+                record: record.to_owned(),
+                group_id: context.group_id.clone(),
+                qos: context.qos,
+                subscriber: context.subscriber.clone(),
+                sub_ids: context.sub_ids.clone(),
+            })
+            .await?
         {
             params
         } else {
             return Ok(());
         };
 
+        let send_time = now_second();
         // publish data to client
         send_publish_packet_to_client(
-            connection_manager,
-            cache_manager,
+            &context.connection_manager,
+            &context.cache_manager,
             &sub_pub_param,
-            qos,
-            sub_thread_stop_sx,
+            &context.qos,
+            &context.sub_thread_stop_sx,
         )
         .await?;
+        let finish_time = now_second();
+
+        let is_enable = &context.cache_manager.get_slow_sub_config().enable;
+
+        if *is_enable {
+            let receive_time = record.timestamp;
+            let calculate_time =
+                get_calculate_time_from_broker_config(send_time, finish_time, receive_time);
+            let config_num = &context.cache_manager.get_slow_sub_config().max_store_num;
+            record_slow_subscribe_data(
+                &context.metrics_cache_manager,
+                calculate_time,
+                *config_num,
+                &context.subscriber,
+            );
+        }
 
         // commit offset
         loop_commit_offset(
-            message_storage,
-            &subscriber.topic_id,
-            group_id,
+            &context.message_storage,
+            &context.subscriber.topic_id,
+            &context.group_id,
             record_offset,
         )
         .await?;
@@ -280,8 +315,8 @@ async fn pub_message(
         }
     }
 
-    subscribe_manager.update_exclusive_push_thread_info(
-        exclusive_key,
+    context.subscribe_manager.update_exclusive_push_thread_info(
+        &context.exclusive_key.clone(),
         success_num as u64,
         error_num as u64,
     );

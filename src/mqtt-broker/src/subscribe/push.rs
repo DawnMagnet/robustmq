@@ -23,7 +23,6 @@ use crate::handler::cache::{CacheManager, QosAckPackageData, QosAckPackageType, 
 use crate::handler::error::MqttBrokerError;
 use crate::handler::message::is_message_expire;
 use crate::handler::sub_option::{get_retain_flag_by_retain_as_published, is_send_msg_by_bo_local};
-use crate::observability::slow::sub::{record_slow_sub_data, SlowSubData};
 use crate::server::common::connection_manager::ConnectionManager;
 use crate::server::common::packet::ResponsePackage;
 use crate::subscribe::common::{is_ignore_push_error, SubPublishParam};
@@ -41,46 +40,54 @@ use tokio::sync::broadcast::{self, Sender};
 use tokio::time::{sleep, timeout};
 use tracing::{debug, warn};
 
-#[allow(clippy::too_many_arguments)]
+#[derive(Clone)]
+pub struct BuildPublishMessageContext {
+    pub cache_manager: Arc<CacheManager>,
+    pub connection_manager: Arc<ConnectionManager>,
+    pub client_id: String,
+    pub record: Record,
+    pub group_id: String,
+    pub qos: QoS,
+    pub subscriber: Subscriber,
+    pub sub_ids: Vec<usize>,
+}
+
 pub async fn build_publish_message(
-    cache_manager: &Arc<CacheManager>,
-    connection_manager: &Arc<ConnectionManager>,
-    client_id: &str,
-    record: Record,
-    group_id: &str,
-    qos: &QoS,
-    subscriber: &Subscriber,
-    sub_ids: &[usize],
+    context: BuildPublishMessageContext,
 ) -> Result<Option<SubPublishParam>, MqttBrokerError> {
-    let msg = MqttMessage::decode_record(record.clone())?;
+    let msg = MqttMessage::decode_record(context.record.clone())?;
 
     if is_message_expire(&msg) {
         debug!("Message dropping: message expires, is not pushed to the client, and is discarded");
         return Ok(None);
     }
 
-    if !is_send_msg_by_bo_local(subscriber.nolocal, &subscriber.client_id, &msg.client_id) {
+    if !is_send_msg_by_bo_local(
+        context.subscriber.nolocal,
+        &context.subscriber.client_id,
+        &msg.client_id,
+    ) {
         debug!(
             "Message dropping: message is not pushed to the client, because the client_id is the same as the subscriber, client_id: {}, topic_id: {}",
-            subscriber.client_id, subscriber.topic_id
+            context.subscriber.client_id, context.subscriber.topic_id
         );
         return Ok(None);
     }
 
-    let connect_id = if let Some(id) = cache_manager.get_connect_id(client_id) {
+    let connect_id = if let Some(id) = context.cache_manager.get_connect_id(&context.client_id) {
         id
     } else {
         return Err(MqttBrokerError::ConnectionNullSkipPushMessage(
-            client_id.to_owned(),
+            context.client_id.to_owned(),
         ));
     };
 
-    if let Some(conn) = cache_manager.get_connection(connect_id) {
+    if let Some(conn) = context.cache_manager.get_connection(connect_id) {
         if msg.payload.len() > (conn.max_packet_size as usize) {
             debug!(
                 "{:?}",
                 MqttBrokerError::PacketsExceedsLimitBySubPublish(
-                    client_id.to_owned(),
+                    context.client_id.to_owned(),
                     msg.payload.len(),
                     conn.max_packet_size
                 )
@@ -90,25 +97,27 @@ pub async fn build_publish_message(
     }
 
     let mut contain_properties = false;
-    if let Some(protocol) = connection_manager.get_connect_protocol(connect_id) {
+    if let Some(protocol) = context.connection_manager.get_connect_protocol(connect_id) {
         if MqttProtocol::is_mqtt5(&protocol) {
             contain_properties = true;
         }
     }
 
-    let pkid = cache_manager
+    let pkid = context
+        .cache_manager
         .pkid_metadata
-        .generate_pkid(client_id, qos)
+        .generate_pkid(&context.client_id, &context.qos)
         .await;
 
-    let retain = get_retain_flag_by_retain_as_published(subscriber.preserve_retain, msg.retain);
+    let retain =
+        get_retain_flag_by_retain_as_published(context.subscriber.preserve_retain, msg.retain);
 
     let publish = Publish {
         dup: false,
-        qos: qos.to_owned(),
+        qos: context.qos,
         p_kid: pkid,
         retain,
-        topic: Bytes::from(subscriber.topic_name.clone()),
+        topic: Bytes::from(context.subscriber.topic_name.clone()),
         payload: msg.payload,
     };
 
@@ -120,7 +129,7 @@ pub async fn build_publish_message(
             response_topic: msg.response_topic,
             correlation_data: msg.correlation_data,
             user_properties: msg.user_properties,
-            subscription_identifiers: sub_ids.into(),
+            subscription_identifiers: context.sub_ids,
             content_type: msg.content_type,
         })
     } else {
@@ -129,10 +138,10 @@ pub async fn build_publish_message(
 
     let packet = MqttPacket::Publish(publish, properties);
     let sub_pub_param = SubPublishParam::new(
-        subscriber.clone(),
+        context.subscriber.clone(),
         packet,
-        record.timestamp as u128,
-        group_id.to_string(),
+        context.record.timestamp as u128,
+        context.group_id.to_string(),
         pkid,
     );
     Ok(Some(sub_pub_param))
@@ -254,7 +263,7 @@ pub async fn push_packet_to_client(
             "Subsceibe".to_string(),
         );
 
-        send_message_to_client(resp, sub_pub_param, connection_manager, cache_manager).await
+        send_message_to_client(resp, connection_manager).await
     };
 
     retry_tool_fn_timeout(action_fn, stop_sx, "push_packet_to_client").await
@@ -346,9 +355,7 @@ pub async fn wait_packet_ack(
 
 pub async fn send_message_to_client(
     resp: ResponsePackage,
-    sub_pub_param: &SubPublishParam,
     connection_manager: &Arc<ConnectionManager>,
-    metadata_cache: &Arc<CacheManager>,
 ) -> ResultMqttBrokerError {
     let protocol =
         if let Some(protocol) = connection_manager.get_connect_protocol(resp.connection_id) {
@@ -377,16 +384,6 @@ pub async fn send_message_to_client(
             .await?
     }
 
-    // record slow sub data
-    if metadata_cache.get_slow_sub_config().enable && sub_pub_param.create_time > 0 {
-        let slow_data = SlowSubData::build(
-            sub_pub_param.subscribe.sub_path.clone(),
-            sub_pub_param.subscribe.client_id.clone(),
-            sub_pub_param.subscribe.topic_name.clone(),
-            (now_mills() - sub_pub_param.create_time) as u64,
-        );
-        record_slow_sub_data(slow_data, metadata_cache.get_slow_sub_config().whole_ms)?;
-    }
     Ok(())
 }
 
